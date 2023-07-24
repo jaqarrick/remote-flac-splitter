@@ -1,0 +1,160 @@
+#!/bin/bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+verbose="false"
+
+function command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+: ${SSH_PORT:=22} # Default port unless otherwise specified
+function source_ssh_credentials() {
+	if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ]; then
+		echo -e "${RED}Error: SSH_HOST or SSH_USER not specified${NC}"
+		echo -e "${YELLOW}Fix this by defining them like so:"
+		echo -e "SSH_HOST=foo SSH_USER=bar ./command or add them to your ~/.zprofile or similar file${NC}"
+	fi
+}
+
+function init_download() {
+	if [ "$verbose" = "true" ]; then
+		echo "Initiating download via scp"
+		echo "USER: $SSH_USER"
+		echo "HOST: $SSH_HOST"
+		echo "PORT: $SSH_PORT"
+	fi
+	if ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "[ -d $source_dir ]"; then
+		scp -r -P "$SSH_PORT" "$SSH_USER@$SSH_HOST":"$source_dir" "$target_dir"
+	else
+		echo -e "${RED}Error: remote directory does not exist. Check the file path and try again.${NC}"
+		exit 1
+	fi
+}
+
+function split_flac() {
+	flac_parent_directory="$target_dir/$(basename "$source_dir")"
+	cd "$flac_parent_directory"
+
+	if [[ $(find "$flac_parent_directory" -maxdepth 1 -type f -name "*.cue" -o -name "*.flac" | wc -l) -gt 0 ]]; then
+		# Get the names of files with .cue and .flac extensions
+		cue_file=$(find "$flac_parent_directory" -maxdepth 1 -type f -name "*.cue" -exec basename {} \;)
+		original_flac_file=$(find "$flac_parent_directory" -maxdepth 1 -type f -name "*.flac" -exec basename {} \;)
+
+		if [ "$verbose" = "true" ]; then
+			echo "Attempting to split flac file into individual tracks using unflac"
+		fi
+		# Print the names of the files
+		echo "CUE files found: $cue_files"
+		echo "FLAC files found: $flac_files"
+		unflac "$cue_file"
+	else
+		echo "No files with .cue or .flac extensions found in the current directory."
+		exit 1
+	fi
+}
+
+function init_upload() {
+	if [[ $(find "$flac_parent_directory" -type f -name "*.flac" | wc -l) -gt 1 ]]; then
+		# Get the directory containing multiple FLAC files
+		target_flac_dir=$(find "$flac_parent_directory" -type f -name "*.flac" -print0 | xargs -0 dirname | sort | uniq -d)
+		if [[ -n "$target_flac_dir" ]]; then
+			# Navigate into the directory containing multiple FLAC files
+			cd "$target_flac_dir"
+			echo "Navigated to: $(pwd)"
+			echo "Orignal: $original_flac_file"
+			# Upload each FLAC file to the remote destination
+			for flac_file in *.flac; do
+				scp -P "$SSH_PORT" "$flac_file" "$SSH_USER"@"$SSH_HOST":"$source_dir"
+				echo "Uploaded: $flac_file to $SSH_HOST:$source_dir"
+			done
+		else
+			echo "No directory found containing multiple FLAC files."
+			exit 1
+		fi
+	else
+		echo "No multiple FLAC files found in the current directory."
+		exit 1
+	fi
+}
+
+function cleanup() {
+	read -p "Do you want to remove the orignal flac file ($original_flac_file) in the remote location? (y/n): " answer
+	# Check the user's response
+	if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+		remote_file_path="$source_dir/$original_flac_file"
+		if ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "[ -e $remote_file_path ]"; then
+			ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "rm $remote_file_path"
+		else
+			echo -e "${RED}Error: remote file not found. Something went wrong${NC}"
+			exit 1
+		fi
+	fi
+
+	cd $target_dir
+	pwd
+	tree
+	ls
+}
+
+function usage() {
+	echo -e "Usage: ${YELLOW}$0${NC} ${BLUE}<source_dir>${NC}"
+	exit 1
+}
+
+function main() {
+	source_dir="$1"
+	source_ssh_credentials
+	shift
+	while getopts ":o:vd" opt; do
+		case $opt in
+		o)
+			target_dir="$OPTARG"
+			;;
+		v)
+			verbose="true"
+			;;
+		d)
+			dry_run="true"
+			;;
+		\?)
+			echo "Invalid option: -$OPTARG" >&2
+			exit 1
+			;;
+		:)
+			echo "Option -$OPTARG requires an argument." >&2
+			exit 1
+			;;
+		esac
+	done
+	# todo, probably just only alow tmp for now
+	if [ -z "$target_dir" ]; then
+		target_dir="$(mktemp -d)"
+	fi
+
+	echo "$target_dir"
+	if [ "$verbose" = "true" ]; then
+		echo "Initiating script in verbose mode:"
+		echo "Target directory: $target_dir"
+		echo "Source directory: $source_dir"
+		echo "Dry run: $dry_run"
+	fi
+
+	if [ -z "$source_dir" ]; then
+		echo -e "${RED}Error: One argument is required; the source path.${NC}"
+		usage
+	elif command_exists "unflac"; then
+		init_download
+		split_flac
+		init_upload
+		cleanup
+	else
+		echo -e "${RED}Error: You must have the unflac binary installed to run this command.${NC}"
+		exit 1
+	fi
+}
+
+main "$@"

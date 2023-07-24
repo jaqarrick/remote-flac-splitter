@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "Formatting bash script"
+shfmt -w download
